@@ -347,7 +347,7 @@ async def on_message(message):
     # ============================================================
     # MODIFICAR PRESUPUESTO
     # ============================================================
-    elif any(palabra in contenido.lower() for palabra in ["cambia presupuesto", "cambiar presupuesto", "actualiza presupuesto", "modifica presupuesto"]):
+    elif any(palabra in contenido.lower() for palabra in ["cambia presupuesto", "cambiar presupuesto", "actualiza presupuesto", "modifica presupuesto", "cambia el presupuesto", "cambiar el presupuesto"]):
         await message.reply("⚙️ Actualizando presupuesto...")
         respuesta = modificar_presupuesto(contenido)
         await message.reply(respuesta)
