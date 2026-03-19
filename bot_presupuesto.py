@@ -44,8 +44,6 @@ MENU_CATEGORIAS = """
 
 # ============================================================
 # MEMORIA CONVERSACIONAL
-# Guarda el estado de conversaciones pendientes por usuario
-# formato: {user_id: {"accion": "esperando_comentario", "fila": N}}
 # ============================================================
 estado_usuarios = {}
 
@@ -57,7 +55,7 @@ intents.message_content = True
 client = discord.Client(intents=intents)
 
 # ============================================================
-# CONFIGURACIÓN DE GOOGLE SHEETS
+# GOOGLE SHEETS
 # ============================================================
 def get_creds():
     creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
@@ -69,13 +67,71 @@ def get_creds():
 
 def get_sheet():
     gc = gspread.authorize(get_creds())
-    sh = gc.open(SPREADSHEET_NAME)
-    return sh.worksheet(SHEET_NAME)
+    return gc.open(SPREADSHEET_NAME).worksheet(SHEET_NAME)
 
 def get_budget_sheet():
     gc = gspread.authorize(get_creds())
-    sh = gc.open(SPREADSHEET_NAME)
-    return sh.worksheet("Presupuesto")
+    return gc.open(SPREADSHEET_NAME).worksheet("Presupuesto")
+
+def get_contexto_financiero():
+    """Obtiene todos los datos financieros del mes actual para dárselos al agente."""
+    ahora = datetime.now()
+    mes_actual = ahora.month
+    año_actual = ahora.year
+    mes_str = ahora.strftime("%B %Y")
+
+    # Gastos del mes
+    sheet = get_sheet()
+    gastos = sheet.get_all_records()
+    gastos_mes = [
+        g for g in gastos
+        if f"/{ahora.strftime('%m')}/" in str(g.get("Fecha", ""))
+        and str(g.get("Fecha", "")).endswith(str(año_actual))
+    ]
+
+    totales = {}
+    detalle_gastos = []
+    for g in gastos_mes:
+        cat = g.get("Categoría", "Otro")
+        monto = float(str(g.get("Monto", 0)).replace(".", "").replace(",", "") or 0)
+        totales[cat] = totales.get(cat, 0) + monto
+        detalle_gastos.append(f"- {g.get('Fecha','')} | {g.get('Comercio','')} | {cat} | ${monto:,.0f} | {g.get('Responsable','')}")
+
+    # Presupuestos del mes
+    budget_sheet = get_budget_sheet()
+    presupuestos = budget_sheet.get_all_records()
+    presupuestos_mes = [
+        p for p in presupuestos
+        if str(p.get("Mes", "")).strip() == str(mes_actual)
+        and str(p.get("Año", "")).strip() == str(año_actual)
+    ]
+
+    resumen_presupuesto = []
+    for p in presupuestos_mes:
+        cat = p.get("Categoría", "")
+        presupuesto = float(str(p.get("Presupuesto", 0)).replace(".", "").replace(",", "") or 0)
+        gastado = totales.get(cat, 0)
+        disponible = presupuesto - gastado
+        porcentaje = (gastado / presupuesto * 100) if presupuesto > 0 else 0
+        resumen_presupuesto.append(
+            f"- {cat}: Presupuesto ${presupuesto:,.0f} | Gastado ${gastado:,.0f} | Disponible ${disponible:,.0f} | {porcentaje:.0f}% usado"
+        )
+
+    contexto = f"""=== CONTEXTO FINANCIERO FAMILIAR - {mes_str} ===
+
+GASTOS DEL MES:
+{chr(10).join(detalle_gastos) if detalle_gastos else 'Sin gastos registrados aún'}
+
+RESUMEN POR CATEGORÍA:
+{chr(10).join([f'- {cat}: ${total:,.0f}' for cat, total in totales.items()]) if totales else 'Sin gastos'}
+
+PRESUPUESTOS VS GASTOS:
+{chr(10).join(resumen_presupuesto) if resumen_presupuesto else 'Sin presupuestos definidos para este mes'}
+
+TOTAL GASTADO: ${sum(totales.values()):,.0f}
+DÍAS DEL MES: {ahora.day} de {ahora.strftime('%B')}
+"""
+    return contexto, presupuestos_mes, totales, mes_actual, año_actual
 
 # ============================================================
 # ANALIZAR BOLETA CON CLAUDE
@@ -87,20 +143,16 @@ def analizar_boleta(image_url, categoria_num):
     message = anthropic_client.messages.create(
         model="claude-opus-4-20250514",
         max_tokens=1024,
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "url",
-                            "url": image_url,
-                        },
-                    },
-                    {
-                        "type": "text",
-                        "text": f"""Eres un asistente de control presupuestario familiar chileno.
+        messages=[{
+            "role": "user",
+            "content": [
+                {
+                    "type": "image",
+                    "source": {"type": "url", "url": image_url},
+                },
+                {
+                    "type": "text",
+                    "text": f"""Eres un asistente de control presupuestario familiar chileno.
 Analiza esta foto de boleta o ticket y extrae la información en formato JSON.
 La categoría ya fue seleccionada por el usuario: {categoria}
 
@@ -115,10 +167,9 @@ Responde SOLO con este JSON exacto, sin texto adicional:
 
 Si no puedes leer algún dato, usa "No disponible" para texto o 0 para monto.
 El monto debe ser solo el número, sin puntos ni comas ni símbolo $."""
-                    }
-                ],
-            }
-        ],
+                }
+            ],
+        }],
     )
 
     response_text = message.content[0].text.strip()
@@ -130,127 +181,72 @@ El monto debe ser solo el número, sin puntos ni comas ni símbolo $."""
     return json.loads(response_text.strip())
 
 # ============================================================
-# CONSULTAS DE PRESUPUESTO
+# AGENTE IA - procesa cualquier mensaje de texto
 # ============================================================
-def consultar_presupuesto(pregunta, username):
+def agente_ia(mensaje, nombre_real):
     try:
-        ahora = datetime.now()
-        mes_actual = ahora.month
-        año_actual = ahora.year
-        mes_str = ahora.strftime("%m/%Y")
-
-        sheet = get_sheet()
-        gastos = sheet.get_all_records()
-        gastos_mes = [
-            g for g in gastos
-            if f"/{ahora.strftime('%m')}/" in str(g.get("Fecha", ""))
-            and str(g.get("Fecha", "")).endswith(str(año_actual))
-        ]
-
-        totales = {}
-        for gasto in gastos_mes:
-            cat = gasto.get("Categoría", "Otro")
-            monto = float(str(gasto.get("Monto", 0)).replace(".", "").replace(",", "") or 0)
-            totales[cat] = totales.get(cat, 0) + monto
-
-        resumen = f"Gastos del mes ({mes_str}):\n"
-        for cat, total in totales.items():
-            resumen += f"- {cat}: ${total:,.0f}\n"
-
-        budget_sheet = get_budget_sheet()
-        presupuestos = budget_sheet.get_all_records()
-        presupuestos_mes = [
-            p for p in presupuestos
-            if str(p.get("Mes", "")).strip() == str(mes_actual)
-            and str(p.get("Año", "")).strip() == str(año_actual)
-        ]
-
-        resumen += "\nPresupuestos del mes:\n"
-        for p in presupuestos_mes:
-            cat = p.get("Categoría", "")
-            monto_presupuesto = float(str(p.get("Presupuesto", 0)).replace(".", "").replace(",", "") or 0)
-            gastado = totales.get(cat, 0)
-            disponible = monto_presupuesto - gastado
-            if monto_presupuesto > 0:
-                resumen += f"- {cat}: Presupuesto ${monto_presupuesto:,.0f} | Gastado ${gastado:,.0f} | Disponible ${disponible:,.0f}\n"
-
+        contexto, presupuestos_mes, totales, mes_actual, año_actual = get_contexto_financiero()
         anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY, http_client=httpx.Client())
+
         response = anthropic_client.messages.create(
             model="claude-opus-4-20250514",
-            max_tokens=500,
-            messages=[{
-                "role": "user",
-                "content": f"""Eres un asistente de presupuesto familiar amigable.
-El usuario pregunta: "{pregunta}"
+            max_tokens=800,
+            system=f"""Eres un asistente financiero familiar amigable llamado "Presupuesto Familiar MyD".
+Ayudas a Diego y Mariana a llevar el control de sus gastos mensuales.
 
-Aquí están los datos actuales:
-{resumen}
+Tienes acceso a los datos financieros del mes actual y puedes:
+1. Responder preguntas sobre gastos y presupuesto
+2. Dar consejos financieros
+3. Indicar si quieren MODIFICAR un presupuesto (detecta la intención)
 
-Responde de forma concisa y amigable en español, usando emojis. Máximo 5 líneas."""
-            }]
-        )
+Si el usuario quiere MODIFICAR un presupuesto, responde SOLO con este JSON exacto:
+{{"accion": "modificar_presupuesto", "categoria": "nombre exacto", "monto": 0}}
 
-        return response.content[0].text
-
-    except Exception as e:
-        return f"❌ Error al consultar el presupuesto: {str(e)}"
-
-# ============================================================
-# MODIFICAR PRESUPUESTO
-# ============================================================
-def modificar_presupuesto(mensaje):
-    try:
-        ahora = datetime.now()
-        mes_actual = ahora.month
-        año_actual = ahora.year
-
-        # Usar Claude para extraer categoría y monto del mensaje
-        anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY, http_client=httpx.Client())
-        response = anthropic_client.messages.create(
-            model="claude-opus-4-20250514",
-            max_tokens=200,
-            messages=[{
-                "role": "user",
-                "content": f"""Extrae la categoría y el monto del siguiente mensaje de cambio de presupuesto.
 Las categorías válidas son: Supermercado, Transporte, Salud, Hogar, Entretenimiento Mariana, Entretenimiento Diego, Otro.
 
-Mensaje: "{mensaje}"
+Para cualquier otra consulta, responde de forma conversacional, amigable y con emojis. Máximo 6 líneas.
+El usuario que escribe ahora es: {nombre_real}
 
-Responde SOLO con este JSON exacto:
-{{"categoria": "nombre exacto de la categoría", "monto": 0}}
-
-Si no puedes identificar la categoría o el monto, responde:
-{{"categoria": null, "monto": null}}"""
-            }]
+{contexto}""",
+            messages=[{"role": "user", "content": mensaje}]
         )
 
-        data = json.loads(response.content[0].text.strip())
-        categoria = data.get("categoria")
-        monto = data.get("monto")
+        respuesta = response.content[0].text.strip()
 
-        if not categoria or not monto:
-            return "❌ No pude entender la categoría o el monto. Intenta así: 'cambia presupuesto salud a 200000'"
+        # Verificar si el agente quiere modificar presupuesto
+        if respuesta.startswith("{") and "modificar_presupuesto" in respuesta:
+            try:
+                data = json.loads(respuesta)
+                categoria = data.get("categoria")
+                monto = data.get("monto")
 
-        # Buscar y actualizar en Google Sheets
-        budget_sheet = get_budget_sheet()
-        presupuestos = budget_sheet.get_all_records()
+                if categoria and monto:
+                    budget_sheet = get_budget_sheet()
+                    presupuestos = budget_sheet.get_all_records()
 
-        for i, p in enumerate(presupuestos):
-            if (str(p.get("Mes", "")).strip() == str(mes_actual)
-                    and str(p.get("Año", "")).strip() == str(año_actual)
-                    and p.get("Categoría", "").lower() == categoria.lower()):
-                # +2 porque get_all_records es 0-indexed y hay fila de encabezado
-                fila = i + 2
-                col_presupuesto = 4  # Columna D
-                budget_sheet.update_cell(fila, col_presupuesto, monto)
-                return f"✅ Presupuesto de **{categoria}** actualizado a **${monto:,}** para {ahora.strftime('%B %Y')} 📊"
+                    actualizado = False
+                    for i, p in enumerate(presupuestos):
+                        if (str(p.get("Mes", "")).strip() == str(mes_actual)
+                                and str(p.get("Año", "")).strip() == str(año_actual)
+                                and p.get("Categoría", "").lower() == categoria.lower()):
+                            budget_sheet.update_cell(i + 2, 4, monto)
+                            actualizado = True
+                            break
 
-        # Si no existe la fila para este mes, la creamos
-        budget_sheet.append_row([mes_actual, año_actual, categoria, monto])
-        return f"✅ Presupuesto de **{categoria}** establecido en **${monto:,}** para {ahora.strftime('%B %Y')} 📊"
+                    if not actualizado:
+                        budget_sheet.append_row([mes_actual, año_actual, categoria, monto])
+
+                    gastado = totales.get(categoria, 0)
+                    disponible = monto - gastado
+                    return f"✅ **Presupuesto de {categoria} actualizado a ${monto:,}**\n💰 Gastado: ${gastado:,} | Disponible: ${disponible:,}"
+
+            except json.JSONDecodeError:
+                pass
+
+        return respuesta
 
     except Exception as e:
-        return f"❌ Error al modificar el presupuesto: {str(e)}"
+        return f"❌ Error: {str(e)}"
 
 # ============================================================
 # EVENTOS DE DISCORD
@@ -281,8 +277,7 @@ async def on_message(message):
         else:
             try:
                 sheet = get_sheet()
-                col_comentario = 7  # Columna G
-                sheet.update_cell(fila, col_comentario, contenido)
+                sheet.update_cell(fila, 7, contenido)
                 await message.reply(f"💬 Comentario guardado: *\"{contenido}\"*")
             except Exception as e:
                 await message.reply(f"❌ Error al guardar comentario: {str(e)}")
@@ -317,13 +312,10 @@ async def on_message(message):
                 datos.get("monto", 0),
                 datos.get("descripcion", ""),
                 nombre_real,
-                ""  # Comentario vacío por ahora
+                ""
             ])
 
-            # Obtener número de la última fila agregada
             ultima_fila = len(sheet.get_all_values())
-
-            # Guardar estado esperando comentario
             estado_usuarios[user_id] = {
                 "accion": "esperando_comentario",
                 "fila": ultima_fila
@@ -345,19 +337,11 @@ async def on_message(message):
             await message.reply(f"❌ Error al procesar la boleta: {str(e)}\nIntenta de nuevo.")
 
     # ============================================================
-    # MODIFICAR PRESUPUESTO
+    # CUALQUIER MENSAJE DE TEXTO → AGENTE IA
     # ============================================================
-    elif any(palabra in contenido.lower() for palabra in ["cambia presupuesto", "cambiar presupuesto", "actualiza presupuesto", "modifica presupuesto", "cambia el presupuesto", "cambiar el presupuesto"]):
-        await message.reply("⚙️ Actualizando presupuesto...")
-        respuesta = modificar_presupuesto(contenido)
-        await message.reply(respuesta)
-
-    # ============================================================
-    # CONSULTAR PRESUPUESTO
-    # ============================================================
-    elif any(palabra in contenido.lower() for palabra in ["cuánto", "cuanto", "presupuesto", "queda", "gastamos", "gasté", "gaste", "resumen", "disponible"]):
-        await message.reply("🤔 Consultando tu presupuesto...")
-        respuesta = consultar_presupuesto(contenido, username)
+    elif contenido:
+        await message.reply("🤔 Consultando...")
+        respuesta = agente_ia(contenido, nombre_real)
         await message.reply(respuesta)
 
 # ============================================================
