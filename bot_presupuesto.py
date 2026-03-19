@@ -1,9 +1,10 @@
 import discord
-import anthropic
 import gspread
 from google.oauth2.service_account import Credentials
 import json
 import os
+import httpx
+from anthropic import Anthropic
 from datetime import datetime
 
 # ============================================================
@@ -77,7 +78,7 @@ def get_budget_sheet():
 # ANALIZAR BOLETA CON CLAUDE
 # ============================================================
 def analizar_boleta(image_url, categoria_num):
-    anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY, http_client=httpx.Client())
     categoria = CATEGORIAS.get(categoria_num, "Otro")
     
     message = anthropic_client.messages.create(
@@ -163,7 +164,7 @@ def consultar_presupuesto(pregunta, username):
             if monto_presupuesto > 0:
                 resumen += f"- {cat}: Presupuesto ${monto_presupuesto:,.0f} | Gastado ${gastado:,.0f} | Disponible ${disponible:,.0f}\n"
         
-        anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY, http_client=httpx.Client())
         response = anthropic_client.messages.create(
             model="claude-opus-4-20250514",
             max_tokens=500,
